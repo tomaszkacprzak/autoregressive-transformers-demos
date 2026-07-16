@@ -492,6 +492,22 @@ def sample_layout(
     return Layout(prompt_ids, request_ids, target_ids, prompt_level, request_level)
 
 
+def make_super_resolution_layout(spec: PyramidSpec) -> Layout:
+    """Fixed 2x2-to-8x8 super-resolution layout for batch figures."""
+
+    try:
+        prompt_level = spec.grid_sizes.index(2)
+        request_level = spec.grid_sizes.index(8)
+    except ValueError as exc:
+        raise ValueError(
+            "super-resolution figures require --grid-sizes to include 2 and 8"
+        ) from exc
+
+    prompt_ids = list(spec.ids_by_level[prompt_level])
+    request_ids = list(spec.ids_by_level[request_level])
+    target_ids = spec.generation_order(request_ids, prompt_ids, rng=None)
+    return Layout(prompt_ids, request_ids, target_ids, prompt_level, request_level)
+
 def make_plot_layout(
     spec: PyramidSpec,
     request_level: int,
@@ -1207,6 +1223,87 @@ def _canvas_from_selected_patches(
 
 
 @torch.no_grad()
+def make_super_resolution_figure(
+    model: PyramidAutoregressor,
+    tokenizer: TransformerPatchAutoencoder,
+    fixed_images: torch.Tensor,
+    layout: Layout,
+    spec: PyramidSpec,
+    patch_size: int,
+    batch_step: int,
+    device: torch.device,
+) -> plt.Figure:
+    """Generate a 2x2-patch prompt -> full 8x8-patch query figure."""
+
+    model.eval()
+    tokenizer.eval()
+    images = fixed_images.to(device)
+    pyramid = build_mean_pyramid(images, spec.grid_sizes, patch_size)
+    patches = pyramid_patches(pyramid, spec, patch_size)
+    latents = encode_pyramid(tokenizer, patches, spec)
+
+    prompt_latents = gather_nodes(latents, layout.prompt_ids, spec)
+    generated_latents = model.generate(prompt_latents, layout.prompt_ids, layout.target_ids)
+    generated_index = {node_id: index for index, node_id in enumerate(layout.target_ids)}
+
+    request_grid = spec.grid_sizes[layout.request_level]
+    request_level_patches = patches[layout.request_level]
+    generated_request_patches = torch.zeros_like(request_level_patches)
+    decoded_request = decode_node_latents(
+        tokenizer,
+        torch.stack(
+            [generated_latents[:, generated_index[node_id]] for node_id in layout.request_ids],
+            dim=1,
+        ),
+        layout.request_ids,
+        spec,
+    )
+    for output_index, node_id in enumerate(layout.request_ids):
+        local_index = spec.nodes[node_id].local_index
+        generated_request_patches[:, local_index] = decoded_request[:, output_index]
+
+    prompt_grid = spec.grid_sizes[layout.prompt_level]
+    prompt_image = unpatchify(patches[layout.prompt_level], prompt_grid, patch_size)
+    true_full = unpatchify(request_level_patches, request_grid, patch_size)
+    generated_full = unpatchify(generated_request_patches, request_grid, patch_size)
+    difference = true_full - generated_full
+
+    rows = [prompt_image, true_full, generated_full, difference]
+    row_labels = [
+        "prompt 2x2 patches",
+        "true 8x8 patches",
+        "generated 8x8 patches",
+        "difference",
+    ]
+    figure, axes = plt.subplots(4, 8, figsize=(16, 8), squeeze=False)
+    cmaps = ["Spectral_r", "Spectral_r", "Spectral_r", "coolwarm"]
+    for row_index, row_images in enumerate(rows):
+        for column in range(8):
+            vmin = 0 if row_index < 3 else None
+            vmax = 1 if row_index < 3 else None
+            axes[row_index, column].imshow(
+                row_images[column, 0].detach().cpu().numpy(),
+                cmap=cmaps[row_index],
+                vmin=vmin,
+                vmax=vmax,
+            )
+            axes[row_index, column].set_xticks([])
+            axes[row_index, column].set_yticks([])
+        axes[row_index, 0].set_ylabel(row_labels[row_index])
+
+    prompt_resolution = prompt_grid * patch_size
+    request_resolution = request_grid * patch_size
+    figure.suptitle(
+        f"AR batch {batch_step}: super-resolution "
+        f"{prompt_grid}x{prompt_grid} patches ({prompt_resolution}x{prompt_resolution}) -> "
+        f"{request_grid}x{request_grid} patches ({request_resolution}x{request_resolution})",
+        fontsize=12,
+    )
+    figure.subplots_adjust(wspace=0, hspace=0)
+    return figure
+
+
+@torch.no_grad()
 def make_autoregressive_figure(
     model: PyramidAutoregressor,
     tokenizer: TransformerPatchAutoencoder,
@@ -1423,6 +1520,7 @@ def train_autoregressor(
     val_loader: DataLoader[torch.Tensor],
     fixed_images: torch.Tensor,
     plot_layout: Layout,
+    super_resolution_layout: Layout,
     spec: PyramidSpec,
     args: argparse.Namespace,
     device: torch.device,
@@ -1494,6 +1592,16 @@ def train_autoregressor(
             epoch_totals["pixel"] += pixel_loss.item()
             epoch_totals["mean"] += mean_loss.item()
             epoch_totals["batches"] += 1
+            super_resolution_figure = make_super_resolution_figure(
+                model,
+                tokenizer,
+                fixed_images,
+                super_resolution_layout,
+                spec,
+                args.patch_size,
+                batch_step,
+                device,
+            )
             run.log(
                 {
                     "ar/batch_step": batch_step,
@@ -1507,8 +1615,10 @@ def train_autoregressor(
                     "ar/train_batch_generated_count": len(layout.target_ids),
                     "ar/train_batch_prompt_order": layout.prompt_level + 1,
                     "ar/train_batch_request_order": layout.request_level + 1,
+                    "ar/super_resolution_figure": wandb.Image(super_resolution_figure),
                 }
             )
+            plt.close(super_resolution_figure)
 
         validation = evaluate_autoregressor(
             model, tokenizer, val_loader, spec, args, device
@@ -1642,6 +1752,7 @@ def main() -> None:
         request_count=args.plot_request_patches,
         seed=args.seed + 3,
     )
+    super_resolution_layout = make_super_resolution_layout(spec)
 
     serializable_config = dict(vars(args))
     serializable_config["output_dir"] = str(args.output_dir)
