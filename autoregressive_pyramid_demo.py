@@ -25,7 +25,7 @@ resolutions 32x32, 64x64, and 128x128.
 """
 
 from __future__ import annotations
-
+print(f"Starting script..")
 import argparse
 import json
 import math
@@ -82,7 +82,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Data and pyramid.
     parser.add_argument("--grid-sizes", type=parse_grid_sizes, default=parse_grid_sizes("2,4,8"))
     parser.add_argument("--patch-size", type=int, default=16)
-    parser.add_argument("--train-size", type=int, default=20000)
+    parser.add_argument("--train-size", type=int, default=100000)
     parser.add_argument("--val-size", type=int, default=1000)
     parser.add_argument("--sigma-min", type=float, default=10.0)
     parser.add_argument("--sigma-max", type=float, default=20.0)
@@ -90,12 +90,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mean-col", type=float, default=64.0)
 
     # Optimization.
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--tokenizer-epochs", type=int, default=10)
-    parser.add_argument("--ar-epochs", type=int, default=20)
+    parser.add_argument("--ar-epochs", type=int, default=400)
     parser.add_argument("--tokenizer-lr", type=float, default=3e-4)
-    parser.add_argument("--ar-lr", type=float, default=3e-4)
+    parser.add_argument("--ar-lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
 
@@ -1127,8 +1127,8 @@ def make_tokenizer_figure(
     cmaps = ["Spectral_r", "Spectral_r", "coolwarm"]
     for row_index, row_images in enumerate(rows):
         for column in range(8):
-            vmin = 0 if row_index<2 else None
-            vmax = 1 if row_index<2 else None
+            vmin = 0 if row_index<2 else -0.1
+            vmax = 1 if row_index<2 else +0.1
             axes[row_index, column].imshow(
                 row_images[column, 0].detach().cpu().numpy(),
                 cmap=cmaps[row_index],
@@ -1279,8 +1279,8 @@ def make_super_resolution_figure(
     cmaps = ["Spectral_r", "Spectral_r", "Spectral_r", "coolwarm"]
     for row_index, row_images in enumerate(rows):
         for column in range(8):
-            vmin = 0 if row_index < 3 else None
-            vmax = 1 if row_index < 3 else None
+            vmin = 0 if row_index < 3 else -0.1
+            vmax = 1 if row_index < 3 else +0.1
             axes[row_index, column].imshow(
                 row_images[column, 0].detach().cpu().numpy(),
                 cmap=cmaps[row_index],
@@ -1372,8 +1372,8 @@ def make_autoregressive_figure(
     cmaps = ["Spectral_r", "Spectral_r", "Spectral_r", "coolwarm"]
     for row_index, row_images in enumerate(rows):
         for column in range(8):
-            vmin = 0 if row_index<3 else None
-            vmax = 1 if row_index<3 else None
+            vmin = 0 if row_index<3 else -0.1
+            vmax = 1 if row_index<3 else +0.1
             axes[row_index, column].imshow(
                 row_images[column, 0].detach().cpu().numpy(),
                 cmap=cmaps[row_index],
@@ -1509,7 +1509,8 @@ def train_tokenizer(
 
         print(
             f"[tokenizer {epoch:03d}/{args.tokenizer_epochs:03d}] "
-            f"train={epoch_average['loss']:.6f} val={validation['loss']:.6f}"
+            f"train={epoch_average['loss']:.6f} val={validation['loss']:.6f}",
+            flush=True,
         )
 
 
@@ -1655,7 +1656,8 @@ def train_autoregressor(
 
         print(
             f"[autoregressor {epoch:03d}/{args.ar_epochs:03d}] "
-            f"train={epoch_average['loss']:.6f} val={validation['loss']:.6f}"
+            f"train={epoch_average['loss']:.6f} val={validation['loss']:.6f}",
+            flush=True,
         )
 
 
@@ -1682,6 +1684,7 @@ def main() -> None:
         pass
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"Creating datasets..", flush=True)
     image_size = args.grid_sizes[-1] * args.patch_size
     train_dataset = GaussianImageDataset(
         args.train_size,
@@ -1721,6 +1724,7 @@ def main() -> None:
     )
     fixed_images = torch.stack([val_dataset[index] for index in range(8)])
 
+    print(f"Creating model..", flush=True)
     spec = PyramidSpec(args.grid_sizes)
     tokenizer = TransformerPatchAutoencoder(
         patch_size=args.patch_size,
@@ -1760,11 +1764,11 @@ def main() -> None:
     with (args.output_dir / "config.json").open("w", encoding="utf-8") as handle:
         json.dump(serializable_config, handle, indent=2)
 
-    print(f"device: {device}")
-    print(f"pyramid grids: {args.grid_sizes}")
-    print(f"finest image: {image_size}x{image_size}; patch: {args.patch_size}x{args.patch_size}")
-    print(f"tokenizer parameters: {parameter_count(tokenizer):,}")
-    print(f"autoregressor parameters: {parameter_count(autoregressor):,}")
+    print(f"device: {device}", flush=True)
+    print(f"pyramid grids: {args.grid_sizes}", flush=True)
+    print(f"finest image: {image_size}x{image_size}; patch: {args.patch_size}x{args.patch_size}", flush=True)
+    print(f"tokenizer parameters: {parameter_count(tokenizer):,}", flush=True)
+    print(f"autoregressor parameters: {parameter_count(autoregressor):,}", flush=True)
 
     run = wandb.init(
         project=args.wandb_project,
@@ -1792,6 +1796,7 @@ def main() -> None:
             val_loader,
             fixed_images,
             plot_layout,
+            super_resolution_layout,
             spec,
             args,
             device,
